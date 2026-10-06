@@ -1,209 +1,253 @@
-/*
- * SPDX-FileCopyrightText: 2021 John Samuel
- *
- * SPDX-License-Identifier: GPL-3.0-or-later
- *
- */
+#define _POSIX_C_SOURCE 200809L
+
+#include "serveur.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/epoll.h>
 #include <unistd.h>
 
-#include "serveur.h"
+static int socket_serveur = -1;
+static volatile sig_atomic_t arret_demande = 0;
 
-int socketfd; // Déclaration globale de socketfd
-
-/**
- * Cette fonction envoie un message (*data) au client (client_socket_fd)
- * @param client_socket_fd : Le descripteur de socket du client.
- * @param sdata : Le message à envoyer.
- * @return EXIT_SUCCESS en cas de succès, EXIT_FAILURE en cas d'erreur.
- */
-int renvoie_message(int client_socket_fd, char *data)
+static void gerer_sigint(int signal_recu)
 {
-  int data_size = write(client_socket_fd, (void *)data, strlen(data));
-
-  if (data_size < 0)
-  {
-    perror("Erreur d'écriture");
-    return EXIT_FAILURE;
-  }
-
-  return EXIT_SUCCESS;
+    (void)signal_recu;
+    arret_demande = 1;
+    if (socket_serveur >= 0) {
+        (void)close(socket_serveur);
+        socket_serveur = -1;
+    }
 }
 
-/**
- * Cette fonction lit les données envoyées par le client,
- * et renvoie un message en réponse.
- * @param socketfd : Le descripteur de socket du serveur.
- * @param data : Le message.
- * @return EXIT_SUCCESS en cas de succès, EXIT_FAILURE en cas d'erreur.
- */
-int recois_envoie_message(int client_socket_fd, char *data)
+static int envoyer_texte(int socketfd, const char *texte)
 {
-  printf("Message reçu: %s\n", data);
-  char code[10];
-  if (sscanf(data, "%9s:", code) == 1) // Assurez-vous que le format est correct
-  {
-    if (strcmp(code, "message:") == 0)
-    {
-      return renvoie_message(client_socket_fd, data);
+    size_t longueur = strlen(texte);
+    size_t envoye = 0;
+    while (envoye < longueur) {
+        ssize_t resultat = send(socketfd, texte + envoye, longueur - envoye, 0);
+        if (resultat < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("send");
+            return 0;
+        }
+        envoye += (size_t)resultat;
     }
-  }
-
-  return (EXIT_SUCCESS);
+    return 1;
 }
 
-/**
- * Gestionnaire de signal pour Ctrl+C (SIGINT).
- * @param signal : Le signal capturé (doit être SIGINT pour Ctrl+C).
- */
-void gestionnaire_ctrl_c(int signal)
+static int recevoir_ligne(int socketfd, char *tampon, size_t capacite)
 {
-  printf("\nSignal Ctrl+C capturé. Sortie du programme.\n");
-
-  // Fermer le socket si ouvert
-  if (socketfd != -1)
-  {
-    close(socketfd);
-  }
-
-  exit(0); // Quitter proprement le programme.
+    size_t longueur = 0;
+    while (longueur + 1 < capacite) {
+        char caractere;
+        ssize_t resultat = recv(socketfd, &caractere, 1, 0);
+        if (resultat == 0) {
+            if (longueur == 0) {
+                return 0;
+            }
+            break;
+        }
+        if (resultat < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("recv");
+            return -1;
+        }
+        if (caractere == '\n') {
+            break;
+        }
+        tampon[longueur++] = caractere;
+    }
+    tampon[longueur] = '\0';
+    return 1;
 }
 
-/**
- * Gère la communication avec un client spécifique.
- *
- * @param client_socket_fd Le descripteur de socket du client à gérer.
- */
-void gerer_client(int client_socket_fd)
+int renvoie_message(int client_socket_fd, const char *message)
 {
-  char data[1024];
-
-  while (1)
-  {
-    // Réinitialisation des données
-    memset(data, 0, sizeof(data));
-
-    // Lecture des données envoyées par le client
-    int data_size = read(client_socket_fd, data, sizeof(data));
-
-    if (data_size <= 0)
-    {
-      // Erreur de réception ou déconnexion du client
-      if (data_size == 0)
-      {
-        // Le client a fermé la connexion proprement
-        printf("Client déconnecté.\n");
-      }
-      else
-      {
-        perror("Erreur de réception");
-      }
-
-      // Fermer le socket du client et sortir de la boucle de communication
-      close(client_socket_fd);
-      break; // Sortir de la boucle de communication avec ce client
+    char ligne[TAILLE_MESSAGE + 2];
+    int longueur = snprintf(ligne, sizeof ligne, "%s\n", message);
+    if (longueur < 0 || (size_t)longueur >= sizeof ligne) {
+        fprintf(stderr, "Réponse trop longue.\n");
+        return EXIT_FAILURE;
     }
-
-    recois_envoie_message(client_socket_fd, data);
-  }
+    return envoyer_texte(client_socket_fd, ligne) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
-/**
- * Configuration du serveur socket et attente de connexions.
- */
-
-int main()
+static int calculer(char operateur, long long gauche, long long droite,
+                    long long *resultat)
 {
+    switch (operateur) {
+    case '+':
+        *resultat = gauche + droite;
+        return 1;
+    case '-':
+        *resultat = gauche - droite;
+        return 1;
+    case '*':
+        *resultat = gauche * droite;
+        return 1;
+    case '/':
+        if (droite == 0) {
+            return 0;
+        }
+        *resultat = gauche / droite;
+        return 1;
+    case '%':
+        if (droite == 0) {
+            return 0;
+        }
+        *resultat = gauche % droite;
+        return 1;
+    case '&':
+        *resultat = gauche & droite;
+        return 1;
+    case '|':
+        *resultat = gauche | droite;
+        return 1;
+    case '~':
+        *resultat = ~gauche;
+        return 1;
+    default:
+        return 0;
+    }
+}
 
-  int bind_status;                // Statut de la liaison
-  struct sockaddr_in server_addr; // Structure pour l'adresse du serveur
-  int option = 1;                 // Option pour setsockopt
+static int traiter_calcul(int client_socket_fd, const char *message)
+{
+    char operateur;
+    long long num1;
+    long long num2;
+    long long resultat;
+    int consommes = 0;
 
-  // Création d'une socket
-  socketfd = socket(AF_INET, SOCK_STREAM, 0);
-
-  // Vérification si la création de la socket a réussi
-  if (socketfd < 0)
-  {
-    perror("Impossible d'ouvrir une socket");
-    return -1;
-  }
-
-  // Configuration de l'option SO_REUSEADDR pour permettre la réutilisation de l'adresse du serveur
-  setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
-
-  // Initialisation de la structure server_addr
-  memset(&server_addr, 0, sizeof(server_addr));
-  server_addr.sin_family = AF_INET;
-  server_addr.sin_port = htons(PORT);       // Port d'écoute du serveur
-  server_addr.sin_addr.s_addr = INADDR_ANY; // Accepter les connexions de n'importe quelle adresse
-
-  // Liaison de l'adresse à la socket
-  bind_status = bind(socketfd, (struct sockaddr *)&server_addr, sizeof(server_addr));
-
-  // Vérification si la liaison a réussi
-  if (bind_status < 0)
-  {
-    perror("bind");
-    return (EXIT_FAILURE);
-  }
-
-  // Enregistrement de la fonction de gestion du signal Ctrl+C
-  signal(SIGINT, gestionnaire_ctrl_c);
-
-  // Mise en attente de la socket pour accepter les connexions entrantes jusqu'à une limite de 10 connexions en attente
-  listen(socketfd, 10);
-
-  printf("Serveur en attente de connexions...\n");
-
-  struct sockaddr_in client_addr;                     // Structure pour l'adresse du client
-  unsigned int client_addr_len = sizeof(client_addr); // Longueur de la structure client_addr
-  int client_socket_fd;                               // Descripteur de socket du client
-
-  // Boucle infinie
-  while (1)
-  {
-    // Nouvelle connexion cliente
-    client_socket_fd = accept(socketfd, (struct sockaddr *)&client_addr, &client_addr_len);
-
-    if (client_socket_fd < 0)
-    {
-      perror("accept");
-      continue; // Continuer à attendre d'autres connexions en cas d'erreur
+    if (sscanf(message, "calcule : %c %lld %lld %n",
+               &operateur, &num1, &num2, &consommes) != 3
+        && sscanf(message, "%c %lld %lld %n",
+                  &operateur, &num1, &num2, &consommes) != 3) {
+        return renvoie_message(client_socket_fd, "Erreur : calcul invalide");
+    }
+    while (message[consommes] == ' ' || message[consommes] == '\t') {
+        consommes++;
+    }
+    if (message[consommes] != '\0'
+        || !calculer(operateur, num1, num2, &resultat)) {
+        return renvoie_message(client_socket_fd,
+                               "Erreur : opération invalide ou division par zéro");
     }
 
-    // Créer un processus enfant pour gérer la communication avec le client
-    pid_t child_pid = fork();
+    char reponse[128];
+    (void)snprintf(reponse, sizeof reponse, "calcule : %lld", resultat);
+    return renvoie_message(client_socket_fd, reponse);
+}
 
-    if (child_pid == 0)
-    {
-      // Code du processus enfant
-      close(socketfd); // Fermer la socket du serveur dans le processus enfant
-      gerer_client(client_socket_fd);
-      exit(0); // Quitter le processus enfant
+int recois_envoie_message(int client_socket_fd, char *message)
+{
+    printf("Message reçu : %s\n", message);
+    if (strncmp(message, "message: ", 9) == 0) {
+        char reponse[TAILLE_MESSAGE];
+        printf("Réponse à envoyer au client : ");
+        fflush(stdout);
+        if (fgets(reponse, sizeof reponse, stdin) == NULL) {
+            return renvoie_message(client_socket_fd,
+                                   "Erreur : aucune réponse saisie par le serveur");
+        }
+        size_t longueur = strcspn(reponse, "\n");
+        reponse[longueur] = '\0';
+        char message_reponse[TAILLE_MESSAGE + 16];
+        int taille = snprintf(message_reponse, sizeof message_reponse,
+                              "message: %s", reponse);
+        if (taille < 0 || (size_t)taille >= sizeof message_reponse) {
+            return renvoie_message(client_socket_fd, "Erreur : réponse trop longue");
+        }
+        return renvoie_message(client_socket_fd, message_reponse);
     }
-    else if (child_pid < 0)
-    {
-      perror("fork");
-      close(client_socket_fd); // Fermer le socket du client en cas d'erreur
+    if (strncmp(message, "calcule :", 9) == 0
+        || strchr("+-*/%&|~", message[0]) != NULL) {
+        return traiter_calcul(client_socket_fd, message);
     }
-    else
-    {
-      // Code du processus parent
-      close(client_socket_fd); // Fermer le socket du client dans le processus parent
-    }
-  }
+    return renvoie_message(client_socket_fd, "Erreur : requête inconnue");
+}
 
-  // Le programme ne devrait jamais atteindre cette ligne dans la boucle infinie
-  return 0;
+static void gerer_client(int client_socket_fd)
+{
+    char message[TAILLE_MESSAGE];
+    while (!arret_demande) {
+        int statut = recevoir_ligne(client_socket_fd, message, sizeof message);
+        if (statut <= 0) {
+            if (statut < 0) {
+                perror("réception");
+            }
+            break;
+        }
+        if (recois_envoie_message(client_socket_fd, message) != EXIT_SUCCESS) {
+            break;
+        }
+    }
+    (void)close(client_socket_fd);
+}
+
+int main(void)
+{
+    struct sockaddr_in adresse;
+    int option = 1;
+
+    socket_serveur = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_serveur < 0) {
+        perror("socket");
+        return EXIT_FAILURE;
+    }
+    if (setsockopt(socket_serveur, SOL_SOCKET, SO_REUSEADDR,
+                   &option, sizeof option) != 0) {
+        perror("setsockopt");
+        (void)close(socket_serveur);
+        return EXIT_FAILURE;
+    }
+    memset(&adresse, 0, sizeof adresse);
+    adresse.sin_family = AF_INET;
+    adresse.sin_port = htons(PORT);
+    adresse.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(socket_serveur, (struct sockaddr *)&adresse, sizeof adresse) != 0) {
+        perror("bind");
+        (void)close(socket_serveur);
+        return EXIT_FAILURE;
+    }
+    if (listen(socket_serveur, 10) != 0) {
+        perror("listen");
+        (void)close(socket_serveur);
+        return EXIT_FAILURE;
+    }
+    (void)signal(SIGINT, gerer_sigint);
+    (void)signal(SIGPIPE, SIG_IGN);
+    printf("Serveur en attente de connexions...\n");
+    fflush(stdout);
+
+    while (!arret_demande) {
+        struct sockaddr_in adresse_client;
+        socklen_t longueur_adresse = sizeof adresse_client;
+        int client_socket_fd = accept(socket_serveur,
+                                      (struct sockaddr *)&adresse_client,
+                                      &longueur_adresse);
+        if (client_socket_fd < 0) {
+            if (errno == EINTR || arret_demande) {
+                continue;
+            }
+            perror("accept");
+            continue;
+        }
+        gerer_client(client_socket_fd);
+    }
+
+    if (socket_serveur >= 0) {
+        (void)close(socket_serveur);
+    }
+    return EXIT_SUCCESS;
 }

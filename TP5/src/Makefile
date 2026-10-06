@@ -1,23 +1,15 @@
 CC ?= gcc
+CFLAGS ?= -std=c11 -Wall -Wextra -Werror -pedantic -g
 
-CFLAGS=-Wall -Wextra -g
+all: serveur client
 
-COBJS ?= client.o
-SOBJS ?= serveur.o 
+serveur: serveur.c
+	$(CC) $(CFLAGS) -o $@ $<
 
-.SUFFIXES: .c .o
+client: client.c
+	$(CC) $(CFLAGS) -o $@ $<
 
-SERVER = serveur
-CLIENT = client
+clean:
+	rm -f serveur client
 
-all: $(SERVER) $(CLIENT)
-
-$(SERVER): $(SOBJS)
-	$(CC) -o $(SERVER) $(SOBJS)
-
-$(CLIENT): $(COBJS)
-	$(CC) -o $(CLIENT) $(COBJS)
-
-.c.o: 
-	$(CC) -c $*.c
-
+.PHONY: all clean
